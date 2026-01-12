@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import pickle
 from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from sglang_omni.core.types import CompleteMessage, DataReadyMessage
 from sglang_omni.engine.base import Engine
+from sglang_omni.relay.descriptor import Descriptor
+from sglang_omni.relay.relays.shm import SHMRelay
 
 if TYPE_CHECKING:
     from sglang_omni.pipeline.stage import Stage
@@ -97,34 +102,67 @@ class Worker:
         """Send data to next stage."""
         logger.debug("Worker: routing %s to %s", request_id, next_stage)
 
-        # Write to SHM
-        success, metadata = self.stage.data_plane.put(
-            request_id=request_id,
-            data=data,
-            from_stage=self.stage.name,
-            to_stage=next_stage,
-        )
-        if not success or metadata is None:
-            await self._send_failure(request_id, "Failed to write to SHM")
+        # Write using unified relay interface
+        try:
+            # Create descriptor(s) based on relay type
+            if isinstance(self.stage.relay, SHMRelay):
+                # SHMRelay: just pass data reference, it will pickle internally
+                descriptor = Descriptor((1, 0, "cpu", data))
+            else:
+                # NIXLRelay: need to serialize data first to get correct size
+                # Serialize the data to bytes
+                serialized_data = pickle.dumps(data)
+                data_size = len(serialized_data)
+                
+                # Create a numpy buffer to hold the serialized data
+                # Use np.frombuffer to create a view, then copy to make it writable
+                buffer = np.frombuffer(serialized_data, dtype=np.uint8).copy()
+                
+                # Create descriptor with correct size
+                descriptor = Descriptor((
+                    buffer.ctypes.data,
+                    data_size,
+                    "cpu",
+                    buffer
+                ))
+
+            # Put data and get metadata
+            readable_op = await self.stage.relay.put_async([descriptor])
+            metadata = readable_op.metadata()
+
+            logger.debug(
+                "Worker: data written from %s to %s for req=%s",
+                self.stage.name,
+                next_stage,
+                request_id,
+            )
+
+            # Get endpoint
+            endpoint = self.stage.endpoints.get(next_stage)
+            if endpoint is None:
+                await self._send_failure(request_id, f"Unknown stage: {next_stage}")
+                return
+
+            # Send notification
+            await self.stage.control_plane.send_to_stage(
+                next_stage,
+                endpoint,
+                DataReadyMessage(
+                    request_id=request_id,
+                    from_stage=self.stage.name,
+                    to_stage=next_stage,
+                    shm_metadata=metadata,
+                ),
+            )
+
+            await readable_op.wait_for_completion()
+
+        except Exception as e:
+            logger.error("Worker: failed to write data for req=%s: %s", request_id, e)
+            await self._send_failure(request_id, f"Failed to write data: {e}")
             return
 
-        # Get endpoint
-        endpoint = self.stage.endpoints.get(next_stage)
-        if endpoint is None:
-            await self._send_failure(request_id, f"Unknown stage: {next_stage}")
-            return
 
-        # Send notification
-        await self.stage.control_plane.send_to_stage(
-            next_stage,
-            endpoint,
-            DataReadyMessage(
-                request_id=request_id,
-                from_stage=self.stage.name,
-                to_stage=next_stage,
-                shm_metadata=metadata,
-            ),
-        )
 
     async def _send_failure(self, request_id: str, error: str) -> None:
         """Send failure to coordinator."""

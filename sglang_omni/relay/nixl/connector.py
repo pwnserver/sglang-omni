@@ -31,8 +31,10 @@ from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-# Import descriptor-related classes from descriptor.py
 from sglang_omni.relay.descriptor import Descriptor, DeviceKind, SerializedDescriptor
+
+# Import descriptor-related classes from descriptor.py
+from sglang_omni.relay.operations.base import BaseReadableOperation, BaseReadOperation
 
 try:
     pass
@@ -1073,7 +1075,7 @@ class PassiveOperation(AbstractOperation):
         raise NotImplementedError("Abstract method not implemented by derived class.")
 
 
-class ReadOperation(ActiveOperation):
+class ReadOperation(ActiveOperation, BaseReadOperation):
     """
     Operation that initiates an RDMA read operation to transfer data from a remote worker's `ReadableOperation`,
     as described by `remote_metadata`, to local buffers.
@@ -1179,7 +1181,7 @@ class ReadOperation(ActiveOperation):
         await super()._wait_for_completion_()
 
 
-class ReadableOperation(PassiveOperation):
+class ReadableOperation(PassiveOperation, BaseReadableOperation):
     """
     Operation that can be awaited until a remote worker has completed a `ReadOperation`.
     """
