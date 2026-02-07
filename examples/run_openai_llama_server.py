@@ -14,7 +14,7 @@ import torch
 import uvicorn
 
 from sglang_omni import Coordinator
-from sglang_omni.gateway import Gateway
+from sglang_omni.client import Client
 from sglang_omni.serve import create_app
 
 logging.basicConfig(
@@ -269,8 +269,8 @@ async def run_server(host: str, port: int) -> None:
     await coordinator.start()
     completion_task = asyncio.create_task(coordinator.run_completion_loop())
 
-    gateway = Gateway(coordinator)
-    app = create_app(gateway)
+    client = Client(coordinator)
+    app = create_app(client)
 
     config = uvicorn.Config(app, host=host, port=port, log_level="info")
     server = uvicorn.Server(config)
