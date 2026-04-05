@@ -1,19 +1,19 @@
-name: Qwen3-Omni TTS CI
+name: Qwen3-Omni CI
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: qwen3-omni-tts-ci-${{ github.ref }}
+  group: qwen3-omni-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  qwen3-omni-tts-ci:
+  qwen3-omni-ci:
     runs-on: [self-hosted]
     container:
       image: frankleeeee/sglang-omni:dev
@@ -45,7 +45,28 @@ jobs:
           source omni-qwen3/bin/activate
           uv pip install -v -e ".[dev]"
 
-      - name: Run Qwen3-Omni TTS CI (speed + WER)
+      - name: Kill GPU processes
+        shell: bash
+        run: |
+          bash .github/scripts/delete_gpu_process.sh
+
+      - name: Run docs tests
+        timeout-minutes: 60
+        shell: bash
+        run: |
+          source omni-qwen3/bin/activate
+          export PYTHONPATH=$PWD
+          pytest tests/docs/qwen3_omni/test_docs_qwen3_omni.py -v -s -x
+        env:
+          HF_ENDPOINT: https://hf-mirror.com
+
+      - name: Kill GPU processes
+        if: always()
+        shell: bash
+        run: |
+          bash .github/scripts/delete_gpu_process.sh
+
+      - name: Run TTS CI (speed + WER)
         timeout-minutes: 60
         shell: bash
         run: |
