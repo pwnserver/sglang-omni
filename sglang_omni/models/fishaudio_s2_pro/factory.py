@@ -105,10 +105,11 @@ def create_s2pro_sglang_engine(
     # sm_121a (GB10 Blackwell).  Fall back to Triton attention (JIT-compiled)
     # and disable CUDA graphs on unsupported devices.
     _sgl_kernel_supports_device = _check_sgl_kernel_device_support()
-    if server_args.attention_backend is None:
-        server_args.attention_backend = "triton" if not _sgl_kernel_supports_device else "fa3"
     if not _sgl_kernel_supports_device:
+        server_args.attention_backend = "triton"
         server_args.disable_cuda_graph = True
+    elif server_args.attention_backend is None:
+        server_args.attention_backend = "fa3"
     want_cuda_graph = not server_args.disable_cuda_graph
     if want_cuda_graph:
         server_args.enable_return_hidden_states = True

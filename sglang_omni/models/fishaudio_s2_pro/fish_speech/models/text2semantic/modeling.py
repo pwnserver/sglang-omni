@@ -14,7 +14,20 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from sgl_kernel.flash_attn import flash_attn_with_kvcache
+def _sgl_kernel_supports_device() -> bool:
+    """Check if sgl_kernel pre-compiled kernels support the current GPU."""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor <= 120  # sgl_kernel 0.3.x max is sm_120
+
+
+try:
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    _HAS_SGL_FLASH_ATTN = _sgl_kernel_supports_device()
+except (ImportError, RuntimeError):
+    _HAS_SGL_FLASH_ATTN = False
 
 # liger_kernel removed for inference
 from torch import Tensor
@@ -45,10 +58,7 @@ FISH_BATCH_INVARIANT = os.getenv("FISH_BATCH_INVARIANT", "false").lower() in (
 )
 
 
-@torch.library.custom_op(
-    "mylib::flash_attn_kvcache", mutates_args=("k_cache", "v_cache")
-)
-def flash_attn_kvcache_op(
+def _native_flash_attn_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -58,30 +68,92 @@ def flash_attn_kvcache_op(
     causal: bool = False,
     num_splits: int = 0,
 ) -> torch.Tensor:
-    return flash_attn_with_kvcache(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        k=k,
-        v=v,
-        cache_seqlens=cache_seqlens.contiguous() if cache_seqlens is not None else None,
-        causal=causal,
-        num_splits=num_splits,
+    """Pure-PyTorch fallback for flash_attn_with_kvcache.
+
+    Manually updates the KV cache and uses F.scaled_dot_product_attention.
+    Shape convention: q/k/v are (B, seqlen, nheads, headdim),
+    k_cache/v_cache are (B, max_cache_len, nheads_k, headdim).
+    """
+    if k is not None and v is not None and cache_seqlens is not None:
+        bsz, seqlen_new = k.shape[0], k.shape[1]
+        for i in range(bsz):
+            pos = cache_seqlens[i].item()
+            k_cache[i, pos : pos + seqlen_new] = k[i]
+            v_cache[i, pos : pos + seqlen_new] = v[i]
+
+    # Build full K/V from cache up to current lengths
+    if cache_seqlens is not None:
+        seqlen_new = q.shape[1] if k is not None else 0
+        max_len = (cache_seqlens + seqlen_new).max().item()
+        k_full = k_cache[:, :max_len]
+        v_full = v_cache[:, :max_len]
+    else:
+        k_full = k_cache
+        v_full = v_cache
+
+    # Transpose to (B, nheads, seqlen, headdim) for SDPA
+    q_t = q.transpose(1, 2)
+    # GQA: repeat KV heads to match Q heads
+    nheads_q, nheads_k = q_t.shape[1], k_full.shape[2]
+    if nheads_q != nheads_k:
+        rep = nheads_q // nheads_k
+        k_full = k_full.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(
+            k_full.shape[0], k_full.shape[1], nheads_q, k_full.shape[3]
+        )
+        v_full = v_full.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(
+            v_full.shape[0], v_full.shape[1], nheads_q, v_full.shape[3]
+        )
+    k_t = k_full.transpose(1, 2)
+    v_t = v_full.transpose(1, 2)
+
+    out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=causal)
+    return out.transpose(1, 2)  # back to (B, seqlen, nheads, headdim)
+
+
+if _HAS_SGL_FLASH_ATTN:
+
+    @torch.library.custom_op(
+        "mylib::flash_attn_kvcache", mutates_args=("k_cache", "v_cache")
     )
+    def flash_attn_kvcache_op(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        causal: bool = False,
+        num_splits: int = 0,
+    ) -> torch.Tensor:
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens.contiguous()
+            if cache_seqlens is not None
+            else None,
+            causal=causal,
+            num_splits=num_splits,
+        )
 
+    @flash_attn_kvcache_op.register_fake
+    def _(
+        q,
+        k_cache,
+        v_cache,
+        k=None,
+        v=None,
+        cache_seqlens=None,
+        causal=False,
+        num_splits=0,
+    ):
+        return torch.empty_like(q)
 
-@flash_attn_kvcache_op.register_fake
-def _(
-    q,
-    k_cache,
-    v_cache,
-    k=None,
-    v=None,
-    cache_seqlens=None,
-    causal=False,
-    num_splits=0,
-):
-    return torch.empty_like(q)
+else:
+    # sgl_kernel flash_attn not available — use native fallback
+    flash_attn_kvcache_op = _native_flash_attn_kvcache
 
 
 class MyRMSNorm(nn.Module):
