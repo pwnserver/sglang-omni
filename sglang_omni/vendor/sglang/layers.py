@@ -2,19 +2,66 @@
 
 Centralize third-party imports and apply monkey patches here.
 
-Patches applied:
-  - RMSNorm.forward_cuda → forward_native: sgl_kernel CUDA kernels are
-    pre-compiled without sm_121a (GB10 Blackwell).  Pure-PyTorch fallback
-    is correct and CUDA-graph-safe; it just skips the fused kernel.
-  - RMSNorm.forward_with_allreduce_fusion: same native fallback.
+Patches applied (sm_121a / GB10 Blackwell):
+  sgl_kernel ships pre-compiled CUDA kernels that do NOT include sm_121a.
+  On unsupported GPUs we monkey-patch MultiPlatformOp.__init_subclass__ so
+  that every subclass (RMSNorm, RotaryEmbedding, …) dispatches to its
+  forward_native instead of forward_cuda.  This is a single global fix
+  that covers all current and future MultiPlatformOp-based layers.
 These patches can be removed once sgl_kernel ships sm_121a binaries.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Optional, Tuple, Union
 
 import torch
+
+_logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Global MultiPlatformOp patch: force forward_native on unsupported GPUs
+# ---------------------------------------------------------------------------
+# sgl_kernel 0.3.x pre-compiled CUDA kernels cover up to sm_120.
+# sm_121 (GB10 Blackwell) is NOT included → every sgl_kernel op raises
+# "no kernel image is available for execution on the device".
+#
+# MultiPlatformOp.__init__ sets self._forward_method = self.forward_cuda
+# on CUDA devices.  We patch it so that on unsupported GPUs it falls back
+# to self.forward_native (pure PyTorch, correct, slightly slower).
+_SGL_KERNEL_MAX_SM = 120
+
+
+def _device_needs_native_fallback() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    return sm > _SGL_KERNEL_MAX_SM
+
+
+_NEEDS_NATIVE = _device_needs_native_fallback()
+
+if _NEEDS_NATIVE:
+    from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+
+    _orig_mp_init = MultiPlatformOp.__init__
+
+    def _patched_mp_init(self, *args, **kwargs):
+        _orig_mp_init(self, *args, **kwargs)
+        # After original __init__ sets _forward_method to forward_cuda,
+        # override it with forward_native if available.
+        if hasattr(self, "forward_native"):
+            self._forward_method = self.forward_native
+
+    MultiPlatformOp.__init__ = _patched_mp_init
+    _logger.info(
+        "MultiPlatformOp patched: forward_cuda → forward_native "
+        "(sgl_kernel lacks sm_%d%d support)",
+        *torch.cuda.get_device_capability(),
+    )
+
 from sgl_kernel import top_k_top_p_sampling_from_probs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -39,17 +86,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-# ---------------------------------------------------------------------------
-# RMSNorm.forward_cuda monkey-patch
-# ---------------------------------------------------------------------------
-# sgl_kernel's rmsnorm / fused_add_rmsnorm are pre-compiled CUDA kernels
-# that do NOT include sm_121a (NVIDIA GB10 Blackwell).  Calling them raises
-# "no kernel image is available for execution on the device".
-#
-# forward_native is a pure-PyTorch implementation that works on any GPU.
-# It is slightly slower than the fused kernel but correct and graph-safe.
-RMSNorm.forward_cuda = RMSNorm.forward_native
 
 # ---------------------------------------------------------------------------
 # RMSNorm.forward_with_allreduce_fusion monkey-patch
