@@ -18,17 +18,19 @@ from .runtime.s2pro_sglang_ar import (
 from .tokenizer import S2ProTokenizerAdapter
 
 
+# sgl_kernel 0.3.x ships pre-compiled CUDA kernels up to sm_120.
+# Architectures above this (e.g. sm_121a on GB10) will get
+# "no kernel image is available for execution on the device".
+_SGL_KERNEL_MAX_SM = 120
+
+
 def _check_sgl_kernel_device_support() -> bool:
     """Return True if sgl_kernel pre-compiled kernels support the current GPU."""
-    try:
-        x = torch.zeros(1, 8, device="cuda", dtype=torch.bfloat16)
-        w = torch.ones(8, device="cuda", dtype=torch.bfloat16)
-        from sgl_kernel import rmsnorm
-
-        rmsnorm(x, w, 1e-6)
-        return True
-    except RuntimeError:
+    if not torch.cuda.is_available():
         return False
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor  # e.g. 12.1 → 121
+    return sm <= _SGL_KERNEL_MAX_SM
 
 
 def _patch_fish_config_for_sglang(model_path: str) -> None:
