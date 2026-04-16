@@ -2,11 +2,12 @@
 
 Centralize third-party imports and apply monkey patches here.
 
-Patches applied to RMSNorm.forward_cuda:
-  - Empty tensor early return (avoids CUDA kernel launch on zero-element tensors)
-  - cast_x_before_out_mul fallback to forward_native (HF-compatible RMSNorm cast order)
-  - dtype mismatch fallback when residual or post_residual_addition differ from x.dtype
-These patches can be removed once upstream SGLang merges equivalent changes.
+Patches applied:
+  - RMSNorm.forward_cuda → forward_native: sgl_kernel CUDA kernels are
+    pre-compiled without sm_121a (GB10 Blackwell).  Pure-PyTorch fallback
+    is correct and CUDA-graph-safe; it just skips the fused kernel.
+  - RMSNorm.forward_with_allreduce_fusion: same native fallback.
+These patches can be removed once sgl_kernel ships sm_121a binaries.
 """
 
 from __future__ import annotations
@@ -42,49 +43,13 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 # ---------------------------------------------------------------------------
 # RMSNorm.forward_cuda monkey-patch
 # ---------------------------------------------------------------------------
-_orig_forward_cuda = RMSNorm.forward_cuda
-
-
-def _patched_forward_cuda(
-    self,
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor] = None,
-    post_residual_addition: Optional[torch.Tensor] = None,
-    **kwargs,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    if x.numel() == 0:
-        return x
-    if self.cast_x_before_out_mul:
-        return self.forward_native(
-            x,
-            residual,
-            post_residual_addition=post_residual_addition,
-            **kwargs,
-        )
-    if residual is not None and residual.dtype != x.dtype:
-        return self.forward_native(
-            x,
-            residual,
-            post_residual_addition=post_residual_addition,
-            **kwargs,
-        )
-    if post_residual_addition is not None and post_residual_addition.dtype != x.dtype:
-        return self.forward_native(
-            x,
-            residual,
-            post_residual_addition=post_residual_addition,
-            **kwargs,
-        )
-    return _orig_forward_cuda(
-        self,
-        x,
-        residual,
-        post_residual_addition=post_residual_addition,
-        **kwargs,
-    )
-
-
-RMSNorm.forward_cuda = _patched_forward_cuda
+# sgl_kernel's rmsnorm / fused_add_rmsnorm are pre-compiled CUDA kernels
+# that do NOT include sm_121a (NVIDIA GB10 Blackwell).  Calling them raises
+# "no kernel image is available for execution on the device".
+#
+# forward_native is a pure-PyTorch implementation that works on any GPU.
+# It is slightly slower than the fused kernel but correct and graph-safe.
+RMSNorm.forward_cuda = RMSNorm.forward_native
 
 # ---------------------------------------------------------------------------
 # RMSNorm.forward_with_allreduce_fusion monkey-patch
