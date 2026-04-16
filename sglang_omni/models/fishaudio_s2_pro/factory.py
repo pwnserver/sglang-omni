@@ -101,14 +101,12 @@ def create_s2pro_sglang_engine(
 
     _patch_fish_config_for_sglang(server_args.model_path)
 
-    if server_args.attention_backend is None:
-        server_args.attention_backend = "fa3"
-
-    # Enable hidden state capture for unified decode
-    # Note: sgl_kernel pre-compiled CUDA kernels (RMSNorm, RotaryEmb, etc.)
-    # do NOT include sm_121a (GB10 Blackwell), so CUDA graph capture fails.
-    # Force disable until sgl_kernel ships sm_121a binaries.
+    # sgl_kernel / FlashAttention pre-compiled CUDA kernels don't include
+    # sm_121a (GB10 Blackwell).  Fall back to Triton attention (JIT-compiled)
+    # and disable CUDA graphs on unsupported devices.
     _sgl_kernel_supports_device = _check_sgl_kernel_device_support()
+    if server_args.attention_backend is None:
+        server_args.attention_backend = "triton" if not _sgl_kernel_supports_device else "fa3"
     if not _sgl_kernel_supports_device:
         server_args.disable_cuda_graph = True
     want_cuda_graph = not server_args.disable_cuda_graph
