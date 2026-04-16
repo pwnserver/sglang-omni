@@ -18,6 +18,19 @@ from .runtime.s2pro_sglang_ar import (
 from .tokenizer import S2ProTokenizerAdapter
 
 
+def _check_sgl_kernel_device_support() -> bool:
+    """Return True if sgl_kernel pre-compiled kernels support the current GPU."""
+    try:
+        x = torch.zeros(1, 8, device="cuda", dtype=torch.bfloat16)
+        w = torch.ones(8, device="cuda", dtype=torch.bfloat16)
+        from sgl_kernel import rmsnorm
+
+        rmsnorm(x, w, 1e-6)
+        return True
+    except RuntimeError:
+        return False
+
+
 def _patch_fish_config_for_sglang(model_path: str) -> None:
     """Patch FishQwen3Config to add standard HF attribute aliases for SGLang."""
     import sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling  # registers AutoConfig
@@ -90,6 +103,12 @@ def create_s2pro_sglang_engine(
         server_args.attention_backend = "fa3"
 
     # Enable hidden state capture for unified decode
+    # Note: sgl_kernel pre-compiled CUDA kernels (RMSNorm, RotaryEmb, etc.)
+    # do NOT include sm_121a (GB10 Blackwell), so CUDA graph capture fails.
+    # Force disable until sgl_kernel ships sm_121a binaries.
+    _sgl_kernel_supports_device = _check_sgl_kernel_device_support()
+    if not _sgl_kernel_supports_device:
+        server_args.disable_cuda_graph = True
     want_cuda_graph = not server_args.disable_cuda_graph
     if want_cuda_graph:
         server_args.enable_return_hidden_states = True
